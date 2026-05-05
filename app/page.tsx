@@ -31,7 +31,9 @@ import {
   Edit3,
   X,
   Save,
-  Check as CheckIcon
+  Check as CheckIcon,
+  Settings,
+  Menu
 } from 'lucide-react';
 
 // --- Types ---
@@ -51,12 +53,20 @@ interface Conversation {
   createdAt: number;
 }
 
+interface AdvancedSettings {
+  endpoint: string;
+  model: string;
+  apiKey: string;
+}
+
 interface AppState {
   conversations: Record<string, Conversation>;
   activeId: string | null;
   sidebarOpen: boolean;
+  settingsOpen: boolean;
   selectedModel: string;
   geminiKeyIndex: number;
+  advancedSettings: AdvancedSettings;
   createConversation: () => string;
   setActiveId: (id: string) => void;
   updateConversationTitle: (id: string, title: string) => void;
@@ -65,8 +75,10 @@ interface AppState {
   updateMessage: (conversationId: string, messageId: string, content: string) => void;
   editMessageContent: (conversationId: string, messageId: string, content: string) => void;
   toggleSidebar: () => void;
+  setSettingsOpen: (open: boolean) => void;
   setModel: (model: string) => void;
   rotateGeminiKey: () => void;
+  updateAdvancedSettings: (settings: Partial<AdvancedSettings>) => void;
 }
 
 // --- Global API Key ---
@@ -86,8 +98,14 @@ const useAppStore = create<AppState>()(
       conversations: {},
       activeId: null,
       sidebarOpen: true,
+      settingsOpen: false,
       selectedModel: 'gemini-2.5-flash',
       geminiKeyIndex: 0,
+      advancedSettings: {
+        endpoint: '',
+        model: '',
+        apiKey: ''
+      },
       
       createConversation: () => {
         const id = crypto.randomUUID();
@@ -182,11 +200,20 @@ const useAppStore = create<AppState>()(
       }),
 
       toggleSidebar: () => set((state) => ({ sidebarOpen: !state.sidebarOpen })),
+      setSettingsOpen: (open) => set({ settingsOpen: open }),
       setModel: (model) => set({ selectedModel: model }),
-      rotateGeminiKey: () => set((state) => ({ geminiKeyIndex: state.geminiKeyIndex + 1 }))
+      rotateGeminiKey: () => set((state) => ({ geminiKeyIndex: state.geminiKeyIndex + 1 })),
+      updateAdvancedSettings: (settings) => set((state) => ({
+        advancedSettings: { ...state.advancedSettings, ...settings }
+      }))
     }),
     {
       name: 'artifacts-clone-storage',
+      partialize: (state) => ({
+        conversations: state.conversations,
+        selectedModel: state.selectedModel,
+        advancedSettings: state.advancedSettings
+      })
     }
   )
 );
@@ -210,7 +237,7 @@ export default function Button() {
 
 const useChat = () => {
   const [isLoading, setIsLoading] = useState(false);
-  const { addMessage, updateMessage, activeId, conversations, geminiKeyIndex, rotateGeminiKey, selectedModel } = useAppStore();
+  const { addMessage, updateMessage, activeId, conversations, geminiKeyIndex, rotateGeminiKey, selectedModel, advancedSettings } = useAppStore();
   const currentConv = activeId ? conversations[activeId] : null;
 
   const sendMessage = async (content: string) => {
@@ -232,18 +259,30 @@ const useChat = () => {
     setIsLoading(true);
 
     try {
-      if (selectedModel.startsWith('groq-')) {
-        const modelMap: Record<string, string> = {
-          'groq-llama3-70b': 'llama3-70b-8192',
-          'groq-llama3-8b': 'llama3-8b-8192',
-          'groq-mixtral-8x7b': 'mixtral-8x7b-32768'
-        };
-        const model = modelMap[selectedModel] || 'llama3-8b-8192';
+      if (advancedSettings.endpoint || selectedModel.startsWith('groq-')) {
+        let endpoint = 'https://api.groq.com/openai/v1/chat/completions';
+        let authKey = process.env.NEXT_PUBLIC_GROQ_API_KEY || '';
+        let model = selectedModel;
 
-        const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+        if (advancedSettings.endpoint) {
+          endpoint = advancedSettings.endpoint.endsWith('/chat/completions') 
+            ? advancedSettings.endpoint 
+            : `${advancedSettings.endpoint.replace(/\/$/, '')}/chat/completions`;
+          authKey = advancedSettings.apiKey;
+          model = advancedSettings.model || 'gpt-4o';
+        } else {
+          const modelMap: Record<string, string> = {
+            'groq-llama3-70b': 'llama3-70b-8192',
+            'groq-llama3-8b': 'llama3-8b-8192',
+            'groq-mixtral-8x7b': 'mixtral-8x7b-32768'
+          };
+          model = modelMap[selectedModel] || 'llama3-8b-8192';
+        }
+
+        const response = await fetch(endpoint, {
           method: 'POST',
           headers: {
-            'Authorization': `Bearer ${process.env.NEXT_PUBLIC_GROQ_API_KEY}`,
+            'Authorization': `Bearer ${authKey}`,
             'Content-Type': 'application/json'
           },
           body: JSON.stringify({
@@ -539,7 +578,7 @@ const ModelSelector = () => {
 
 // 2. Sidebar Component
 const Sidebar = () => {
-  const { conversations, activeId, setActiveId, deleteConversation, createConversation, sidebarOpen } = useAppStore();
+  const { conversations, activeId, setActiveId, deleteConversation, createConversation, sidebarOpen, setSettingsOpen } = useAppStore();
   
   // Sort by newest
   const sortedConvs = Object.values(conversations).sort((a, b) => b.createdAt - a.createdAt);
@@ -589,11 +628,145 @@ const Sidebar = () => {
             </div>
           </div>
           
-          <div className="mt-auto p-4 border-t border-[#26262F] flex items-center gap-2 text-[11px] text-gray-500">
-            <div className="w-2 h-2 rounded-full bg-green-500"></div>
-            Artifacts Console v1.4.2
+          <div className="mt-auto p-4 border-t border-[#26262F] flex flex-col gap-3">
+             <button
+               onClick={() => setSettingsOpen(true)}
+               className="flex items-center gap-2 text-sm text-gray-400 hover:text-white transition-colors p-2 hover:bg-[#15151C] rounded-md"
+             >
+               <Settings size={16} /> Advanced Settings
+             </button>
+            <div className="flex items-center gap-2 text-[11px] text-gray-500 px-2">
+              <div className="w-2 h-2 rounded-full bg-green-500"></div>
+              Artifacts Console v1.4.2
+            </div>
           </div>
         </motion.div>
+      )}
+    </AnimatePresence>
+  );
+};
+
+const SettingsModal = () => {
+  const { settingsOpen, setSettingsOpen, advancedSettings, updateAdvancedSettings } = useAppStore();
+  const [localSettings, setLocalSettings] = useState(advancedSettings);
+  const [errorMsg, setErrorMsg] = useState('');
+
+  // Sync state when opened
+  useEffect(() => {
+    if (settingsOpen) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setLocalSettings(advancedSettings);
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setErrorMsg('');
+    }
+  }, [settingsOpen, advancedSettings]);
+
+  const handleSave = () => {
+    // Validate
+    if (localSettings.endpoint && !localSettings.endpoint.startsWith('http')) {
+      setErrorMsg('Endpoint must be a valid URL starting with http:// or https://');
+      return;
+    }
+    
+    updateAdvancedSettings({ ...localSettings });
+    setSettingsOpen(false);
+  };
+
+  return (
+    <AnimatePresence>
+      {settingsOpen && (
+        <>
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            onClick={() => setSettingsOpen(false)}
+            className="fixed inset-0 bg-black/60 z-40 backdrop-blur-sm"
+          />
+          <motion.div
+            initial={{ x: '100%' }}
+            animate={{ x: 0 }}
+            exit={{ x: '100%' }}
+            transition={{ type: 'spring', damping: 25, stiffness: 200 }}
+            className="fixed top-0 right-0 h-full w-full max-w-md bg-[#0B0B0F] border-l border-[#26262F] shadow-2xl z-50 flex flex-col"
+          >
+            <div className="flex items-center justify-between p-6 border-b border-[#26262F]">
+              <h2 className="text-lg font-medium text-white flex items-center gap-2">
+                <Settings size={20} className="text-[#D97757]" />
+                Advanced Settings
+              </h2>
+              <button 
+                onClick={() => setSettingsOpen(false)} 
+                className="p-2 text-gray-400 hover:text-white rounded-md hover:bg-[#15151C] transition-colors"
+              >
+                <X size={20} />
+              </button>
+            </div>
+            
+            <div className="flex-1 p-6 overflow-y-auto space-y-6">
+              <div className="bg-[#15151C]/50 rounded-lg p-4 border border-[#26262F] text-sm text-gray-400 mb-6">
+                Configure a custom endpoint to use your own OpenAI-compatible API or alternative LLM provider. This will override the default Gemini/Groq model selection.
+              </div>
+
+              {errorMsg && (
+                <div className="bg-red-500/10 border border-red-500/20 text-red-400 p-3 rounded-md text-sm">
+                  {errorMsg}
+                </div>
+              )}
+
+              <div className="space-y-4">
+                <div>
+                  <label className="block text-sm font-medium text-gray-300 mb-1.5">Custom Endpoint (OpenAI Format)</label>
+                  <input
+                    type="text"
+                    value={localSettings.endpoint}
+                    onChange={(e) => setLocalSettings({...localSettings, endpoint: e.target.value})}
+                    placeholder="https://api.openai.com/v1"
+                    className="w-full bg-[#15151C] border border-[#26262F] rounded-md px-3 py-2 text-white placeholder-gray-600 focus:outline-none focus:border-[#D97757] transition-colors text-sm"
+                  />
+                  <p className="text-xs text-gray-500 mt-1">Leave blank to use defaults</p>
+                </div>
+
+                <div>
+                  <label className="block text-sm font-medium text-gray-300 mb-1.5">Model ID</label>
+                  <input
+                    type="text"
+                    value={localSettings.model}
+                    onChange={(e) => setLocalSettings({...localSettings, model: e.target.value})}
+                    placeholder="gpt-4o"
+                    className="w-full bg-[#15151C] border border-[#26262F] rounded-md px-3 py-2 text-white placeholder-gray-600 focus:outline-none focus:border-[#D97757] transition-colors text-sm"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-sm font-medium text-gray-300 mb-1.5">API Key</label>
+                  <input
+                    type="password"
+                    value={localSettings.apiKey}
+                    onChange={(e) => setLocalSettings({...localSettings, apiKey: e.target.value})}
+                    placeholder="sk-..."
+                    className="w-full bg-[#15151C] border border-[#26262F] rounded-md px-3 py-2 text-white placeholder-gray-600 focus:outline-none focus:border-[#D97757] transition-colors text-sm"
+                  />
+                </div>
+              </div>
+            </div>
+
+            <div className="p-6 border-t border-[#26262F] flex justify-end gap-3 bg-[#0B0B0F]">
+              <button 
+                onClick={() => setSettingsOpen(false)}
+                className="px-4 py-2 text-sm text-gray-300 hover:text-white transition-colors"
+             >
+                Cancel
+              </button>
+              <button 
+                onClick={handleSave}
+                className="px-4 py-2 text-sm bg-[#D97757] hover:bg-[#D97757]/80 text-[#000000] font-medium rounded-md transition-colors"
+              >
+                Save Configuration
+              </button>
+            </div>
+          </motion.div>
+        </>
       )}
     </AnimatePresence>
   );
@@ -692,6 +865,7 @@ export default function App() {
   return (
     <div className="flex h-screen w-full bg-[#0B0B0F] text-[#ECECF1] font-sans overflow-hidden selection:bg-[#D97757]/30">
       <Sidebar />
+      <SettingsModal />
 
       <main className="flex-1 flex flex-col h-full min-w-0">
         {/* Header */}
@@ -699,9 +873,9 @@ export default function App() {
           <div className="flex items-center gap-4">
             <button 
               onClick={toggleSidebar}
-              className="p-1.5 text-gray-400 hover:bg-[#26262F] rounded"
+              className="p-1.5 text-gray-400 hover:text-white transition-colors"
             >
-              {sidebarOpen ? <PanelLeftClose size={18} /> : <PanelLeftOpen size={18} />}
+              <Menu size={20} />
             </button>
             <ModelSelector />
             <button
