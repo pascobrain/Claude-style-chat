@@ -56,6 +56,7 @@ interface AppState {
   activeId: string | null;
   sidebarOpen: boolean;
   selectedModel: string;
+  geminiKeyIndex: number;
   createConversation: () => string;
   setActiveId: (id: string) => void;
   updateConversationTitle: (id: string, title: string) => void;
@@ -65,10 +66,18 @@ interface AppState {
   editMessageContent: (conversationId: string, messageId: string, content: string) => void;
   toggleSidebar: () => void;
   setModel: (model: string) => void;
+  rotateGeminiKey: () => void;
 }
 
 // --- Global API Key ---
-const apiKey = process.env.NEXT_PUBLIC_GEMINI_API_KEY;
+const getApiKey = (index: number = 0) => {
+  const keys = [
+    process.env.NEXT_PUBLIC_GEMINI_API_KEY,
+    process.env.NEXT_PUBLIC_GEMINI_API_KEY_FALLBACK1,
+    process.env.NEXT_PUBLIC_GEMINI_API_KEY_FALLBACK2
+  ];
+  return keys[index % keys.length] || keys[0];
+};
 
 // --- Zustand Store (Persisted) ---
 const useAppStore = create<AppState>()(
@@ -78,6 +87,7 @@ const useAppStore = create<AppState>()(
       activeId: null,
       sidebarOpen: true,
       selectedModel: 'gemini-2.5-flash',
+      geminiKeyIndex: 0,
       
       createConversation: () => {
         const id = crypto.randomUUID();
@@ -172,7 +182,8 @@ const useAppStore = create<AppState>()(
       }),
 
       toggleSidebar: () => set((state) => ({ sidebarOpen: !state.sidebarOpen })),
-      setModel: (model) => set({ selectedModel: model })
+      setModel: (model) => set({ selectedModel: model }),
+      rotateGeminiKey: () => set((state) => ({ geminiKeyIndex: state.geminiKeyIndex + 1 }))
     }),
     {
       name: 'artifacts-clone-storage',
@@ -197,9 +208,9 @@ export default function Button() {
 \`\`\`
 `;
 
-function useChat() {
+const useChat = () => {
   const [isLoading, setIsLoading] = useState(false);
-  const { addMessage, updateMessage, activeId, conversations } = useAppStore();
+  const { addMessage, updateMessage, activeId, conversations, geminiKeyIndex, rotateGeminiKey, selectedModel } = useAppStore();
   const currentConv = activeId ? conversations[activeId] : null;
 
   const sendMessage = async (content: string) => {
@@ -221,28 +232,85 @@ function useChat() {
     setIsLoading(true);
 
     try {
-      // Prepare history for Gemini
-      const history = (currentConv?.messages || []).map(m => ({
-        role: m.role === 'user' ? 'user' : 'model',
-        parts: [{ text: m.content }]
-      }));
+      if (selectedModel.startsWith('groq-')) {
+        const modelMap: Record<string, string> = {
+          'groq-llama3-70b': 'llama3-70b-8192',
+          'groq-llama3-8b': 'llama3-8b-8192',
+          'groq-mixtral-8x7b': 'mixtral-8x7b-32768'
+        };
+        const model = modelMap[selectedModel] || 'llama3-8b-8192';
 
-      const ai = new GoogleGenAI({ apiKey });
-      const responseStream = await ai.models.generateContentStream({
-        model: 'gemini-2.5-flash',
-        contents: [...history, { role: 'user', parts: [{ text: content }] }],
-        config: { systemInstruction: SYSTEM_PROMPT }
-      });
+        const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${process.env.NEXT_PUBLIC_GROQ_API_KEY}`,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            model: model,
+            messages: [
+              { role: 'system', content: SYSTEM_PROMPT },
+              ...(currentConv?.messages || []).map(m => ({ role: m.role, content: m.content })),
+              { role: 'user', content: content }
+            ],
+            stream: true
+          })
+        });
 
-      for await (const chunk of responseStream) {
-        if (chunk.text) {
-          updateMessage(activeId, assistantMsgId, chunk.text);
+        if (!response.body) throw new Error("No response body");
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          const chunk = decoder.decode(value);
+          const lines = chunk.split('\n');
+          for (const line of lines) {
+            if (line.startsWith('data: ')) {
+              const data = line.replace('data: ', '');
+              if (data === '[DONE]') break;
+              try {
+                const json = JSON.parse(data);
+                if (json.choices[0].delta.content) {
+                  updateMessage(activeId, assistantMsgId, json.choices[0].delta.content);
+                }
+              } catch (e) {}
+            }
+          }
+        }
+      } else {
+        // Prepare history for Gemini
+        const history = (currentConv?.messages || []).map(m => ({
+          role: m.role === 'user' ? 'user' : 'model',
+          parts: [{ text: m.content }]
+        }));
+
+        const apiKey = getApiKey(geminiKeyIndex);
+        const ai = new GoogleGenAI({ apiKey: apiKey || '' });
+        const responseStream = await ai.models.generateContentStream({
+          model: 'gemini-2.5-flash',
+          contents: [...history, { role: 'user', parts: [{ text: content }] }],
+          config: { systemInstruction: SYSTEM_PROMPT }
+        });
+
+        for await (const chunk of responseStream) {
+          if (chunk.text) {
+            updateMessage(activeId, assistantMsgId, chunk.text);
+          }
         }
       }
-
-    } catch (error) {
+    } catch (error: any) {
       console.error(error);
-      updateMessage(activeId, assistantMsgId, `\n\nError: ${error instanceof Error ? error.message : 'Failed to reach API'}. Please ensure the NEXT_PUBLIC_GEMINI_API_KEY environment variable is set.`);
+      const isQuotaError = error?.message?.includes('429') || error?.message?.includes('RESOURCE_EXHAUSTED') || error?.status === 429;
+      
+      if (isQuotaError) {
+        rotateGeminiKey();
+        updateMessage(activeId, assistantMsgId, `\n\n[INFO] Rate limit reached. Rotating API key... please try again.`);
+      } else {
+        let errMsg = `\n\nError: ${error instanceof Error ? error.message : 'Failed to reach API'}. Please ensure the NEXT_PUBLIC_GEMINI_API_KEY environment variable is set.`;
+        updateMessage(activeId, assistantMsgId, errMsg);
+      }
     } finally {
       setIsLoading(false);
     }
@@ -327,7 +395,21 @@ const MessageBubble = ({ msg, activeId }: { msg: Message, activeId: string }) =>
             <>
               {msg.role === 'assistant' ? (
                 <div className="prose prose-invert prose-sm max-w-none leading-relaxed prose-pre:bg-transparent prose-pre:p-0">
-                  <ReactMarkdown
+                  {msg.content.includes('[QUOTA_EXCEEDED]') ? (
+                    <div className="bg-red-500/10 border border-red-500/20 text-red-400 p-4 rounded-md my-2 flex flex-col gap-3">
+                       <p>You have exceeded your free tier API quota.</p>
+                       <button onClick={async () => {
+                         if (typeof window !== 'undefined' && (window as any).aistudio?.openSelectKey) {
+                           await (window as any).aistudio.openSelectKey();
+                         } else {
+                           alert("API key selection is only available in AI Studio.");
+                         }
+                       }} className="bg-red-500/20 hover:bg-red-500/30 text-red-300 py-2 px-4 rounded text-sm self-start transition-colors font-medium border border-red-500/30">
+                         Configure API Key
+                       </button>
+                    </div>
+                  ) : (
+                    <ReactMarkdown
                     remarkPlugins={[remarkGfm]}
                     components={{
                       code({ node, inline, className, children, ...props }: any) {
@@ -378,6 +460,7 @@ const MessageBubble = ({ msg, activeId }: { msg: Message, activeId: string }) =>
                   >
                     {msg.content}
                   </ReactMarkdown>
+                  )}
                 </div>
               ) : (
                 <div className="whitespace-pre-wrap prose prose-invert prose-sm max-w-none leading-relaxed text-white prose-p:text-white prose-headings:text-white prose-strong:text-white prose-a:text-[#D97757] prose-ul:text-white prose-ol:text-white prose-li:text-white">
@@ -421,7 +504,9 @@ const ModelSelector = () => {
   const [isOpen, setIsOpen] = useState(false);
   const models = [
     { id: 'gemini-2.5-flash', name: 'Gemini 2.5 Flash' },
-    { id: 'gpt-oss-20b', name: 'Groq (gpt-oss-20b)' } // UI representation as requested
+    { id: 'groq-llama3-70b', name: 'Groq (Llama 3 70B)' },
+    { id: 'groq-llama3-8b', name: 'Groq (Llama 3 8B)' },
+    { id: 'groq-mixtral-8x7b', name: 'Groq (Mixtral 8x7B)' }
   ];
 
   return (
@@ -564,8 +649,9 @@ export default function App() {
     if (!input.trim() || isEnhancing) return;
     setIsEnhancing(true);
     try {
+      const currentApiKey = getApiKey();
       const response = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`,
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${currentApiKey}`,
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -574,7 +660,12 @@ export default function App() {
           })
         }
       );
-      if (!response.ok) throw new Error("API Request failed");
+      if (!response.ok) {
+        if (response.status === 429) {
+          alert('Quota Exceeded. Please configure your own API key using the Configure API Key button in the header.');
+        }
+        throw new Error("API Request failed");
+      }
       const data = await response.json();
       const enhanced = data.candidates?.[0]?.content?.parts?.[0]?.text;
       if (enhanced) setInput(enhanced.trim());
@@ -613,6 +704,19 @@ export default function App() {
               {sidebarOpen ? <PanelLeftClose size={18} /> : <PanelLeftOpen size={18} />}
             </button>
             <ModelSelector />
+            <button
+              onClick={async () => {
+                if (typeof window !== 'undefined' && (window as any).aistudio?.openSelectKey) {
+                  await (window as any).aistudio.openSelectKey();
+                } else {
+                  alert("API Key selection is not available outside AI Studio.");
+                }
+              }}
+              className="hidden md:flex items-center gap-2 text-xs bg-[#26262F] hover:bg-[#D97757]/20 text-gray-300 hover:text-[#D97757] px-2.5 py-1.5 rounded transition-colors border border-[#26262F] hover:border-[#D97757]/40 font-medium"
+              title="Configure API Key"
+            >
+              Configure API Key
+            </button>
           </div>
 
           {/* Mobile Tabs */}
@@ -767,8 +871,9 @@ function ArtifactViewer({ code: initialCode, activeId }: { code: string, activeI
     if (explanation || isExplaining) return;
     setIsExplaining(true);
     try {
+      const currentApiKey = getApiKey();
       const response = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`,
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${currentApiKey}`,
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -777,7 +882,12 @@ function ArtifactViewer({ code: initialCode, activeId }: { code: string, activeI
           })
         }
       );
-      if (!response.ok) throw new Error("API Request failed");
+      if (!response.ok) {
+        if (response.status === 429) {
+          alert('Quota Exceeded. Please configure your own API key using the Configure API Key button in the header.');
+        }
+        throw new Error("API Request failed");
+      }
       const data = await response.json();
       const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
       if (text) setExplanation(text);
